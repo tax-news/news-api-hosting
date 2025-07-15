@@ -179,6 +179,36 @@ class NewsFetcher:
         
         return None
     
+    def extract_thumbnail_url(self, images: Dict[str, Any]) -> str:
+        """Extract thumbnail URL prioritizing Google URLs over proxied ones"""
+        if not isinstance(images, dict):
+            return ''
+        
+        # First priority: Google thumbnail (direct from Google News)
+        google_thumbnail = images.get('thumbnail', '').strip()
+        if google_thumbnail and 'news.google.com' in google_thumbnail:
+            logger.debug(f"Using Google thumbnail: {google_thumbnail}")
+            return google_thumbnail
+        
+        # Second priority: Any other thumbnail that's not from devisty.store
+        proxied_thumbnail = images.get('thumbnailProxied', '').strip()
+        if proxied_thumbnail and 'img.devisty.store' not in proxied_thumbnail:
+            logger.debug(f"Using non-proxied thumbnail: {proxied_thumbnail}")
+            return proxied_thumbnail
+        
+        # Third priority: Use Google thumbnail even if it doesn't have the expected domain
+        if google_thumbnail:
+            logger.debug(f"Using fallback Google thumbnail: {google_thumbnail}")
+            return google_thumbnail
+        
+        # Last resort: Use proxied thumbnail (might be rate limited)
+        if proxied_thumbnail:
+            logger.debug(f"Using proxied thumbnail as last resort: {proxied_thumbnail}")
+            return proxied_thumbnail
+        
+        logger.debug("No thumbnail found")
+        return ''
+    
     def parse_news_data(self, raw_data: Dict[str, Any]) -> List[Dict[str, Any]]:
         """Parse and normalize news data from API response"""
         articles = []
@@ -200,6 +230,8 @@ class NewsFetcher:
                 logger.warning("No items found in API response")
                 return articles
             
+            logger.info(f"Processing {len(news_items)} news items")
+            
             for item in news_items:
                 try:
                     # Convert timestamp to readable date format
@@ -211,15 +243,13 @@ class NewsFetcher:
                             import datetime
                             dt = datetime.datetime.fromtimestamp(int(timestamp) / 1000)
                             published_date = dt.strftime('%Y-%m-%d %H:%M:%S')
-                        except (ValueError, TypeError):
+                        except (ValueError, TypeError) as e:
+                            logger.warning(f"Invalid timestamp {timestamp}: {e}")
                             published_date = str(timestamp)
                     
-                    # Extract thumbnail from images object
-                    thumbnail = ''
+                    # Extract thumbnail using new prioritization logic
                     images = item.get('images', {})
-                    if isinstance(images, dict):
-                        # Try thumbnailProxied first, then thumbnail
-                        thumbnail = images.get('thumbnailProxied', images.get('thumbnail', ''))
+                    thumbnail = self.extract_thumbnail_url(images)
                     
                     # Normalize article data according to the actual API structure
                     article = {
@@ -228,7 +258,7 @@ class NewsFetcher:
                         'publisher': item.get('publisher', '').strip(),
                         'published_date': published_date,
                         'summary': item.get('snippet', '').strip(),
-                        'thumbnail': thumbnail.strip(),
+                        'thumbnail': thumbnail,
                         'language': self.news_language,
                         'category': 'business',
                         'full_content': ''  # This API doesn't provide full content
@@ -236,55 +266,65 @@ class NewsFetcher:
                     
                     # Skip articles with missing essential fields
                     if not article['title'] or not article['url']:
-                        logger.warning(f"Skipping article with missing title or URL")
+                        logger.warning(f"Skipping article with missing title or URL: {article.get('title', 'NO TITLE')}")
                         continue
                     
                     articles.append(article)
+                    logger.debug(f"Added article: {article['title'][:50]}... with thumbnail: {thumbnail[:50] if thumbnail else 'None'}")
                     
-                    # Also process subnews if available
-                    subnews = item.get('subnews', [])
-                    if isinstance(subnews, list) and item.get('hasSubnews', False):
-                        for subitem in subnews:
-                            try:
-                                # Convert subnews timestamp
-                                sub_timestamp = subitem.get('timestamp', '')
-                                sub_published_date = ''
-                                if sub_timestamp:
-                                    try:
-                                        dt = datetime.datetime.fromtimestamp(int(sub_timestamp) / 1000)
-                                        sub_published_date = dt.strftime('%Y-%m-%d %H:%M:%S')
-                                    except (ValueError, TypeError):
-                                        sub_published_date = str(sub_timestamp)
-                                
-                                # Extract subnews thumbnail
-                                sub_thumbnail = ''
-                                sub_images = subitem.get('images', {})
-                                if isinstance(sub_images, dict):
-                                    sub_thumbnail = sub_images.get('thumbnailProxied', sub_images.get('thumbnail', ''))
-                                
-                                sub_article = {
-                                    'title': subitem.get('title', '').strip(),
-                                    'url': subitem.get('newsUrl', '').strip(),
-                                    'publisher': subitem.get('publisher', '').strip(),
-                                    'published_date': sub_published_date,
-                                    'summary': subitem.get('snippet', '').strip(),
-                                    'thumbnail': sub_thumbnail.strip(),
-                                    'language': self.news_language,
-                                    'category': 'business',
-                                    'full_content': ''
-                                }
-                                
-                                if sub_article['title'] and sub_article['url']:
-                                    articles.append(sub_article)
+                    # Also process subnews if available and enabled
+                    if self.include_subnews:
+                        subnews = item.get('subnews', [])
+                        if isinstance(subnews, list) and item.get('hasSubnews', False):
+                            logger.debug(f"Processing {len(subnews)} subnews items")
+                            
+                            for subitem in subnews:
+                                try:
+                                    # Convert subnews timestamp
+                                    sub_timestamp = subitem.get('timestamp', '')
+                                    sub_published_date = ''
+                                    if sub_timestamp:
+                                        try:
+                                            dt = datetime.datetime.fromtimestamp(int(sub_timestamp) / 1000)
+                                            sub_published_date = dt.strftime('%Y-%m-%d %H:%M:%S')
+                                        except (ValueError, TypeError) as e:
+                                            logger.warning(f"Invalid subnews timestamp {sub_timestamp}: {e}")
+                                            sub_published_date = str(sub_timestamp)
                                     
-                            except Exception as e:
-                                logger.warning(f"Error parsing subnews item: {e}")
-                                continue
+                                    # Extract subnews thumbnail using new prioritization logic
+                                    sub_images = subitem.get('images', {})
+                                    sub_thumbnail = self.extract_thumbnail_url(sub_images)
+                                    
+                                    sub_article = {
+                                        'title': subitem.get('title', '').strip(),
+                                        'url': subitem.get('newsUrl', '').strip(),
+                                        'publisher': subitem.get('publisher', '').strip(),
+                                        'published_date': sub_published_date,
+                                        'summary': subitem.get('snippet', '').strip(),
+                                        'thumbnail': sub_thumbnail,
+                                        'language': self.news_language,
+                                        'category': 'business',
+                                        'full_content': ''
+                                    }
+                                    
+                                    if sub_article['title'] and sub_article['url']:
+                                        articles.append(sub_article)
+                                        logger.debug(f"Added subnews: {sub_article['title'][:50]}... with thumbnail: {sub_thumbnail[:50] if sub_thumbnail else 'None'}")
+                                        
+                                except Exception as e:
+                                    logger.warning(f"Error parsing subnews item: {e}")
+                                    continue
                     
                 except Exception as e:
                     logger.warning(f"Error parsing article: {e}")
                     continue
             
+            # Log thumbnail statistics
+            google_thumbnails = sum(1 for article in articles if 'news.google.com' in article.get('thumbnail', ''))
+            proxied_thumbnails = sum(1 for article in articles if 'img.devisty.store' in article.get('thumbnail', ''))
+            no_thumbnails = sum(1 for article in articles if not article.get('thumbnail'))
+            
+            logger.info(f"Thumbnail stats - Google: {google_thumbnails}, Proxied: {proxied_thumbnails}, None: {no_thumbnails}")
             logger.info(f"Successfully parsed {len(articles)} articles")
             return articles
             

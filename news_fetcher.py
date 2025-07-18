@@ -33,14 +33,14 @@ class NewsAPIError(Exception):
 class NewsFetcher:
     def __init__(self):
         self.rapidapi_key = os.getenv('RAPIDAPI_KEY')
-        self.rapidapi_host = os.getenv('RAPIDAPI_HOST', 'google-news13.p.rapidapi.com')
-        self.news_endpoint = os.getenv('NEWS_ENDPOINT', '/business')
-        self.news_language = os.getenv('NEWS_LANGUAGE', 'en-US')
+        self.rapidapi_host = os.getenv('RAPIDAPI_HOST', 'newsnow.p.rapidapi.com')
+        self.news_endpoint = os.getenv('NEWS_ENDPOINT', '/newsv2_top_news_cat')
+        self.news_language = os.getenv('NEWS_LANGUAGE', 'en')
+        self.news_category = os.getenv('NEWS_CATEGORY', 'BUSINESS')
         self.connection_timeout = int(os.getenv('CONNECTION_TIMEOUT', '30'))
         self.read_timeout = int(os.getenv('READ_TIMEOUT', '30'))
         self.max_retries = int(os.getenv('MAX_RETRIES', '3'))
-        self.include_subnews = os.getenv('INCLUDE_SUBNEWS', 'True').lower() == 'true'
-        self.max_articles_per_fetch = int(os.getenv('MAX_ARTICLES_PER_FETCH', '1000'))
+        self.max_pages = int(os.getenv('MAX_PAGES', '5'))
         
         if not self.rapidapi_key:
             raise ValueError("RAPIDAPI_KEY is required in environment variables")
@@ -51,7 +51,7 @@ class NewsFetcher:
     def setup_scheduler(self):
         """Setup background scheduler for fetching news and cleanup"""
         try:
-            # Schedule news fetching
+            # Schedule news fetching every 2 hours
             fetch_interval = int(os.getenv('FETCH_INTERVAL_HOURS', '2'))
             self.scheduler.add_job(
                 func=self.fetch_and_store_news,
@@ -61,18 +61,17 @@ class NewsFetcher:
                 replace_existing=True
             )
             
-            # Schedule daily cleanup
-            cleanup_hour = int(os.getenv('CLEANUP_HOUR', '0'))
-            cleanup_minute = int(os.getenv('CLEANUP_MINUTE', '0'))
+            # Schedule cleanup every 4 hours
+            cleanup_interval = int(os.getenv('CLEANUP_INTERVAL_HOURS', '4'))
             self.scheduler.add_job(
-                func=self.cleanup_old_data,
-                trigger=CronTrigger(hour=cleanup_hour, minute=cleanup_minute),
-                id='cleanup_old_data',
-                name='Cleanup Old Articles',
+                func=self.cleanup_database,
+                trigger=IntervalTrigger(hours=cleanup_interval),
+                id='cleanup_database',
+                name='Cleanup Database',
                 replace_existing=True
             )
             
-            logger.info(f"Scheduler configured: Fetch every {fetch_interval}h, Cleanup daily at {cleanup_hour:02d}:{cleanup_minute:02d}")
+            logger.info(f"Scheduler configured: Fetch every {fetch_interval}h, Cleanup every {cleanup_interval}h")
             
         except Exception as e:
             logger.error(f"Error setting up scheduler: {e}")
@@ -102,24 +101,30 @@ class NewsFetcher:
         except Exception as e:
             logger.error(f"Error stopping scheduler: {e}")
     
-    def fetch_news_from_api(self) -> Optional[Dict[str, Any]]:
+    def fetch_news_from_api(self, page: int = 1) -> Optional[Dict[str, Any]]:
         """Fetch news from external API with retry logic"""
         headers = {
             'x-rapidapi-key': self.rapidapi_key,
-            'x-rapidapi-host': self.rapidapi_host
+            'x-rapidapi-host': self.rapidapi_host,
+            'Content-Type': 'application/json'
         }
         
-        endpoint_url = f"{self.news_endpoint}?lr={self.news_language}"
+        payload = json.dumps({
+            "category": self.news_category,
+            "location": "",
+            "language": self.news_language,
+            "page": page
+        })
         
         for attempt in range(self.max_retries):
             start_time = time.time()
             conn = None
             
             try:
-                logger.info(f"Fetching news from API (attempt {attempt + 1}/{self.max_retries})")
+                logger.info(f"Fetching news from API page {page} (attempt {attempt + 1}/{self.max_retries})")
                 
                 conn = http.client.HTTPSConnection(self.rapidapi_host, timeout=self.connection_timeout)
-                conn.request("GET", endpoint_url, headers=headers)
+                conn.request("POST", self.news_endpoint, payload, headers)
                 
                 response = conn.getresponse()
                 response_time = time.time() - start_time
@@ -128,11 +133,11 @@ class NewsFetcher:
                     data = response.read()
                     response_data = json.loads(data.decode("utf-8"))
                     
-                    logger.info(f"Successfully fetched news data in {response_time:.2f}s")
+                    logger.info(f"Successfully fetched news data for page {page} in {response_time:.2f}s")
                     
                     # Log successful API call
-                    articles_count = len(response_data.get('articles', [])) if isinstance(response_data, dict) else 0
-                    db.log_api_call(endpoint_url, response.status, response_time, articles_count)
+                    articles_count = response_data.get('count', 0)
+                    db.log_api_call(self.news_endpoint, response.status, response_time, articles_count, page)
                     
                     return response_data
                 
@@ -149,7 +154,7 @@ class NewsFetcher:
                     logger.error(error_msg)
                     
                     # Log failed API call
-                    db.log_api_call(endpoint_url, response.status, response_time, 0)
+                    db.log_api_call(self.news_endpoint, response.status, response_time, 0, page)
                     
                     if attempt < self.max_retries - 1:
                         time.sleep(2 ** attempt)
@@ -179,152 +184,71 @@ class NewsFetcher:
         
         return None
     
-    def extract_thumbnail_url(self, images: Dict[str, Any]) -> str:
-        """Extract thumbnail URL prioritizing Google URLs over proxied ones"""
-        if not isinstance(images, dict):
-            return ''
-        
-        # First priority: Google thumbnail (direct from Google News)
-        google_thumbnail = images.get('thumbnail', '').strip()
-        if google_thumbnail and 'news.google.com' in google_thumbnail:
-            logger.debug(f"Using Google thumbnail: {google_thumbnail}")
-            return google_thumbnail
-        
-        # Second priority: Any other thumbnail that's not from devisty.store
-        proxied_thumbnail = images.get('thumbnailProxied', '').strip()
-        if proxied_thumbnail and 'img.devisty.store' not in proxied_thumbnail:
-            logger.debug(f"Using non-proxied thumbnail: {proxied_thumbnail}")
-            return proxied_thumbnail
-        
-        # Third priority: Use Google thumbnail even if it doesn't have the expected domain
-        if google_thumbnail:
-            logger.debug(f"Using fallback Google thumbnail: {google_thumbnail}")
-            return google_thumbnail
-        
-        # Last resort: Use proxied thumbnail (might be rate limited)
-        if proxied_thumbnail:
-            logger.debug(f"Using proxied thumbnail as last resort: {proxied_thumbnail}")
-            return proxied_thumbnail
-        
-        logger.debug("No thumbnail found")
-        return ''
-    
     def parse_news_data(self, raw_data: Dict[str, Any]) -> List[Dict[str, Any]]:
         """Parse and normalize news data from API response"""
         articles = []
         
         try:
-            # Check if response is successful
             if not isinstance(raw_data, dict):
                 logger.warning("Unexpected response format")
                 return articles
             
-            # Check status
-            if raw_data.get('status') != 'success':
-                logger.warning(f"API returned non-success status: {raw_data.get('status')}")
+            # Get articles count
+            count = raw_data.get('count', 0)
+            if count == 0:
+                logger.warning("No articles found in API response")
                 return articles
             
-            # Get items from the response
-            news_items = raw_data.get('items', [])
-            if not news_items:
-                logger.warning("No items found in API response")
-                return articles
+            logger.info(f"Processing {count} news items")
             
-            logger.info(f"Processing {len(news_items)} news items")
-            
-            for item in news_items:
-                try:
-                    # Convert timestamp to readable date format
-                    timestamp = item.get('timestamp', '')
-                    published_date = ''
-                    if timestamp:
-                        try:
-                            # Convert timestamp (milliseconds) to datetime
-                            import datetime
-                            dt = datetime.datetime.fromtimestamp(int(timestamp) / 1000)
-                            published_date = dt.strftime('%Y-%m-%d %H:%M:%S')
-                        except (ValueError, TypeError) as e:
-                            logger.warning(f"Invalid timestamp {timestamp}: {e}")
-                            published_date = str(timestamp)
-                    
-                    # Extract thumbnail using new prioritization logic
-                    images = item.get('images', {})
-                    thumbnail = self.extract_thumbnail_url(images)
-                    
-                    # Normalize article data according to the actual API structure
-                    article = {
-                        'title': item.get('title', '').strip(),
-                        'url': item.get('newsUrl', '').strip(),
-                        'publisher': item.get('publisher', '').strip(),
-                        'published_date': published_date,
-                        'summary': item.get('snippet', '').strip(),
-                        'thumbnail': thumbnail,
-                        'language': self.news_language,
-                        'category': 'business',
-                        'full_content': ''  # This API doesn't provide full content
-                    }
-                    
-                    # Skip articles with missing essential fields
-                    if not article['title'] or not article['url']:
-                        logger.warning(f"Skipping article with missing title or URL: {article.get('title', 'NO TITLE')}")
-                        continue
-                    
-                    articles.append(article)
-                    logger.debug(f"Added article: {article['title'][:50]}... with thumbnail: {thumbnail[:50] if thumbnail else 'None'}")
-                    
-                    # Also process subnews if available and enabled
-                    if self.include_subnews:
-                        subnews = item.get('subnews', [])
-                        if isinstance(subnews, list) and item.get('hasSubnews', False):
-                            logger.debug(f"Processing {len(subnews)} subnews items")
-                            
-                            for subitem in subnews:
-                                try:
-                                    # Convert subnews timestamp
-                                    sub_timestamp = subitem.get('timestamp', '')
-                                    sub_published_date = ''
-                                    if sub_timestamp:
-                                        try:
-                                            dt = datetime.datetime.fromtimestamp(int(sub_timestamp) / 1000)
-                                            sub_published_date = dt.strftime('%Y-%m-%d %H:%M:%S')
-                                        except (ValueError, TypeError) as e:
-                                            logger.warning(f"Invalid subnews timestamp {sub_timestamp}: {e}")
-                                            sub_published_date = str(sub_timestamp)
-                                    
-                                    # Extract subnews thumbnail using new prioritization logic
-                                    sub_images = subitem.get('images', {})
-                                    sub_thumbnail = self.extract_thumbnail_url(sub_images)
-                                    
-                                    sub_article = {
-                                        'title': subitem.get('title', '').strip(),
-                                        'url': subitem.get('newsUrl', '').strip(),
-                                        'publisher': subitem.get('publisher', '').strip(),
-                                        'published_date': sub_published_date,
-                                        'summary': subitem.get('snippet', '').strip(),
-                                        'thumbnail': sub_thumbnail,
-                                        'language': self.news_language,
-                                        'category': 'business',
-                                        'full_content': ''
-                                    }
-                                    
-                                    if sub_article['title'] and sub_article['url']:
-                                        articles.append(sub_article)
-                                        logger.debug(f"Added subnews: {sub_article['title'][:50]}... with thumbnail: {sub_thumbnail[:50] if sub_thumbnail else 'None'}")
-                                        
-                                except Exception as e:
-                                    logger.warning(f"Error parsing subnews item: {e}")
-                                    continue
-                    
-                except Exception as e:
-                    logger.warning(f"Error parsing article: {e}")
+            # Process each news item
+            for i in range(count):
+                news_key = f"news:{i}:"
+                
+                # Extract article data
+                title = raw_data.get(f"{news_key}title", "").strip().strip('"')
+                url = raw_data.get(f"{news_key}url", "").strip().strip('"')
+                top_image = raw_data.get(f"{news_key}top_image", "").strip().strip('"')
+                date = raw_data.get(f"{news_key}date", "").strip().strip('"')
+                short_description = raw_data.get(f"{news_key}short_description", "").strip().strip('"')
+                text = raw_data.get(f"{news_key}text", "").strip().strip('"')
+                
+                # Extract publisher information
+                publisher_href = raw_data.get(f"{news_key}publisher:href", "").strip().strip('"')
+                publisher_title = raw_data.get(f"{news_key}publisher:title", "").strip().strip('"')
+                
+                # Skip articles with missing essential fields
+                if not title or not url:
+                    logger.warning(f"Skipping article with missing title or URL")
                     continue
+                
+                # Convert date format if possible
+                published_date = date
+                if date:
+                    try:
+                        # Parse the date format: "Thu, 17 Jul 2025 17:21:34 GMT"
+                        dt = datetime.strptime(date, '%a, %d %b %Y %H:%M:%S %Z')
+                        published_date = dt.strftime('%Y-%m-%d %H:%M:%S')
+                    except (ValueError, TypeError) as e:
+                        logger.debug(f"Could not parse date {date}: {e}")
+                        published_date = date
+                
+                # Create normalized article
+                article = {
+                    'title': title,
+                    'url': url,
+                    'publisher': publisher_title or publisher_href,
+                    'published_date': published_date,
+                    'summary': short_description or text[:200] + "..." if text else "",
+                    'thumbnail': top_image,
+                    'language': self.news_language,
+                    'category': 'business',
+                    'full_content': text
+                }
+                
+                articles.append(article)
+                logger.debug(f"Added article: {title[:50]}...")
             
-            # Log thumbnail statistics
-            google_thumbnails = sum(1 for article in articles if 'news.google.com' in article.get('thumbnail', ''))
-            proxied_thumbnails = sum(1 for article in articles if 'img.devisty.store' in article.get('thumbnail', ''))
-            no_thumbnails = sum(1 for article in articles if not article.get('thumbnail'))
-            
-            logger.info(f"Thumbnail stats - Google: {google_thumbnails}, Proxied: {proxied_thumbnails}, None: {no_thumbnails}")
             logger.info(f"Successfully parsed {len(articles)} articles")
             return articles
             
@@ -333,31 +257,50 @@ class NewsFetcher:
             return []
     
     def fetch_and_store_news(self):
-        """Main function to fetch news and store in database"""
+        """Main function to fetch news from multiple pages and store in database"""
         try:
-            logger.info("Starting news fetch and store process")
+            logger.info("Starting multi-page news fetch and store process")
             
-            # Fetch news from API
-            raw_data = self.fetch_news_from_api()
-            if not raw_data:
-                logger.warning("No data received from API")
-                return
+            total_articles = 0
+            fetch_timestamp = int(time.time())  # Use timestamp as fetch_order for this batch
             
-            # Parse the data
-            articles = self.parse_news_data(raw_data)
-            if not articles:
-                logger.warning("No articles parsed from API response")
-                return
+            # Fetch pages in reverse order (5, 4, 3, 2, 1)
+            for page in range(self.max_pages, 0, -1):
+                try:
+                    logger.info(f"Fetching page {page}/{self.max_pages}")
+                    
+                    # Fetch news from API
+                    raw_data = self.fetch_news_from_api(page)
+                    if not raw_data:
+                        logger.warning(f"No data received from API for page {page}")
+                        continue
+                    
+                    # Parse the data
+                    articles = self.parse_news_data(raw_data)
+                    if not articles:
+                        logger.warning(f"No articles parsed from API response for page {page}")
+                        continue
+                    
+                    # Store articles in database with fetch order
+                    # Higher page numbers get higher fetch_order values so they appear first
+                    page_fetch_order = fetch_timestamp + (page * 1000)  # Ensure page order within batch
+                    inserted_count = db.bulk_insert_articles(articles, page_fetch_order)
+                    
+                    total_articles += inserted_count
+                    logger.info(f"Page {page}: Stored {inserted_count} articles")
+                    
+                    # Small delay between pages to be respectful
+                    if page > 1:
+                        time.sleep(1)
+                        
+                except Exception as e:
+                    logger.error(f"Error processing page {page}: {e}")
+                    continue
             
-            # Limit the number of articles if configured
-            if len(articles) > self.max_articles_per_fetch:
-                logger.info(f"Limiting articles from {len(articles)} to {self.max_articles_per_fetch}")
-                articles = articles[:self.max_articles_per_fetch]
+            logger.info(f"Total articles stored in this fetch: {total_articles}")
             
-            # Store articles in database
-            inserted_count = db.bulk_insert_articles(articles)
-            
-            logger.info(f"Successfully stored {inserted_count} articles in database")
+            # Cleanup excess articles if needed
+            self.cleanup_database()
             
             # Log summary
             stats = db.get_database_stats()
@@ -368,12 +311,20 @@ class NewsFetcher:
         except Exception as e:
             logger.error(f"Unexpected error in fetch_and_store_news: {e}")
     
-    def cleanup_old_data(self):
-        """Clean up old articles from database"""
+    def cleanup_database(self):
+        """Clean up old articles and excess articles from database"""
         try:
             logger.info("Starting database cleanup process")
-            deleted_count = db.cleanup_old_articles()
-            logger.info(f"Cleanup completed: {deleted_count} old articles removed")
+            
+            # Clean up articles older than retention period
+            old_deleted = db.cleanup_old_articles()
+            
+            # Clean up excess articles if count exceeds limit
+            excess_deleted = db.cleanup_excess_articles()
+            
+            total_deleted = old_deleted + excess_deleted
+            logger.info(f"Cleanup completed: {total_deleted} articles removed ({old_deleted} old, {excess_deleted} excess)")
+            
         except Exception as e:
             logger.error(f"Error during cleanup: {e}")
     

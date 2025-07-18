@@ -73,11 +73,21 @@ class NewsFetcher:
             logger.error(f"Error stopping scheduler: {e}")
     
     def fetch_news_page(self, page: int) -> Optional[str]:
-        """Fetch news from NewsNow API - your exact working code"""
+        """Fetch news from NewsNow API with very conservative rate limiting"""
         max_retries = 3
+        base_wait = 10  # Start with 10 seconds
         
         for attempt in range(max_retries):
             try:
+                # Wait before each request (even first attempt)
+                if attempt > 0:
+                    wait_time = base_wait * (2 ** attempt)  # 10s, 20s, 40s
+                    logger.info(f"Waiting {wait_time}s before retry {attempt + 1}...")
+                    time.sleep(wait_time)
+                else:
+                    # Always wait 3 seconds before first attempt
+                    time.sleep(3)
+                
                 conn = http.client.HTTPSConnection("newsnow.p.rapidapi.com")
                 
                 payload = json.dumps({
@@ -93,7 +103,7 @@ class NewsFetcher:
                     'Content-Type': "application/json"
                 }
                 
-                logger.info(f"Fetching page {page} from NewsNow API (attempt {attempt + 1})")
+                logger.info(f"Attempting to fetch page {page} (attempt {attempt + 1})")
                 
                 conn.request("POST", "/newsv2_top_news_cat", payload, headers)
                 res = conn.getresponse()
@@ -101,27 +111,23 @@ class NewsFetcher:
                 if res.status == 200:
                     data = res.read()
                     response_text = data.decode("utf-8")
-                    logger.info(f"Successfully fetched page {page}")
+                    logger.info(f"✅ Successfully fetched page {page}")
                     return response_text
                 elif res.status == 429:
-                    wait_time = (2 ** attempt) * 2  # Exponential backoff: 2s, 4s, 8s
-                    logger.warning(f"Rate limit hit (429) for page {page}, attempt {attempt + 1}. Waiting {wait_time}s...")
-                    if attempt < max_retries - 1:
-                        time.sleep(wait_time)
-                        continue
-                    else:
-                        logger.error(f"Rate limit exceeded for page {page} after {max_retries} attempts")
+                    logger.warning(f"❌ Rate limit (429) for page {page}, attempt {attempt + 1}")
+                    # Don't return None immediately, let the retry logic handle it
+                    if attempt == max_retries - 1:
+                        logger.error(f"🚫 Completely rate limited after {max_retries} attempts")
                         return None
                 else:
-                    logger.error(f"API error: {res.status}")
-                    return None
+                    logger.error(f"❌ API error {res.status} for page {page}")
+                    if attempt == max_retries - 1:
+                        return None
                     
             except Exception as e:
-                logger.error(f"Error fetching page {page}: {e}")
-                if attempt < max_retries - 1:
-                    time.sleep(2)
-                    continue
-                return None
+                logger.error(f"❌ Connection error for page {page}: {e}")
+                if attempt == max_retries - 1:
+                    return None
             finally:
                 try:
                     conn.close()
@@ -321,31 +327,35 @@ class NewsFetcher:
         return articles
     
     def fetch_and_store_news(self):
-        """Fetch news from multiple pages and store"""
+        """Fetch news with ultra-conservative rate limiting"""
         try:
-            logger.info("Starting news fetch process")
+            logger.info("🚀 Starting CONSERVATIVE news fetch process")
             
             total_articles = 0
             fetch_timestamp = int(time.time())
-            max_pages = int(os.getenv('MAX_PAGES', '3'))
+            max_pages = int(os.getenv('MAX_PAGES', '1'))  # Default to just 1 page
             
-            # Fetch pages in reverse order (3, 2, 1) with longer delays
-            for page in range(max_pages, 0, -1):
+            # Only try ONE page to avoid rate limits
+            for page in range(1, max_pages + 1):  # Start from page 1
                 try:
-                    # Fetch page
+                    logger.info(f"📄 Attempting to fetch page {page} of {max_pages}")
+                    
+                    # Fetch page with long waits
                     response_text = self.fetch_news_page(page)
                     if not response_text:
-                        logger.warning(f"No response from page {page}")
-                        # Wait longer before trying next page if rate limited
-                        time.sleep(5)
+                        logger.warning(f"❌ Failed to get response from page {page}")
+                        # Wait 30 seconds before trying next page
+                        logger.info("⏳ Waiting 30s before continuing...")
+                        time.sleep(30)
                         continue
                     
                     # Parse articles
                     articles = self.parse_response(response_text)
                     if not articles:
-                        logger.warning(f"No articles parsed from page {page}")
-                        # Still wait to avoid rate limits
-                        time.sleep(3)
+                        logger.warning(f"❌ No articles parsed from page {page}")
+                        logger.debug(f"Response preview: {response_text[:200]}...")
+                        # Still wait to avoid hitting API again quickly
+                        time.sleep(10)
                         continue
                     
                     # Store articles
@@ -353,27 +363,27 @@ class NewsFetcher:
                     inserted_count = db.bulk_insert_articles(articles, page_fetch_order)
                     
                     total_articles += inserted_count
-                    logger.info(f"Page {page}: Stored {inserted_count} articles")
+                    logger.info(f"✅ Page {page}: Successfully stored {inserted_count} articles")
                     
-                    # Always wait between pages to respect rate limits
-                    if page > 1:
-                        wait_time = 5  # 5 seconds between pages
-                        logger.info(f"Waiting {wait_time}s before next page...")
-                        time.sleep(wait_time)
+                    # Wait 60 seconds between pages if doing multiple
+                    if page < max_pages:
+                        logger.info("⏳ Waiting 60s before next page...")
+                        time.sleep(60)
                         
                 except Exception as e:
-                    logger.error(f"Error processing page {page}: {e}")
-                    # Wait even on error to avoid hammering the API
-                    time.sleep(3)
+                    logger.error(f"❌ Error processing page {page}: {e}")
+                    # Wait 30 seconds even on error
+                    time.sleep(30)
                     continue
             
-            logger.info(f"Total articles stored: {total_articles}")
+            logger.info(f"🎉 Total articles stored: {total_articles}")
             
-            # Cleanup if needed
-            self.cleanup_database()
+            # Only cleanup if we actually got some articles
+            if total_articles > 0:
+                self.cleanup_database()
             
         except Exception as e:
-            logger.error(f"Error in fetch_and_store_news: {e}")
+            logger.error(f"❌ Error in fetch_and_store_news: {e}")
     
     def cleanup_database(self):
         """Clean up database"""

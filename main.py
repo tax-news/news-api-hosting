@@ -50,6 +50,7 @@ class StatsResponse(BaseModel):
     oldest_article_date: Optional[str]
     recent_api_calls_24h: int
     retention_days: int
+    max_articles: int
 
 class SchedulerStatusResponse(BaseModel):
     scheduler_running: bool
@@ -62,8 +63,8 @@ class ManualFetchResponse(BaseModel):
 
 # Create FastAPI app
 app = FastAPI(
-    title=os.getenv('API_TITLE', 'News API'),
-    description=os.getenv('API_DESCRIPTION', 'Business News API with automated caching'),
+    title=os.getenv('API_TITLE', 'Business News API'),
+    description=os.getenv('API_DESCRIPTION', 'Business News API with automated multi-page caching'),
     version=os.getenv('API_VERSION', '1.0.0'),
     debug=os.getenv('API_DEBUG', 'False').lower() == 'true'
 )
@@ -86,12 +87,12 @@ MAX_PAGE_SIZE = int(os.getenv('MAX_PAGE_SIZE', '100'))
 async def startup_event():
     """Initialize the application"""
     try:
-        logger.info("Starting News API application...")
+        logger.info("Starting Business News API application...")
         
         # Start the news fetcher scheduler
         news_fetcher.start_scheduler()
         
-        logger.info("News API application started successfully")
+        logger.info("Business News API application started successfully")
         
     except Exception as e:
         logger.error(f"Error during startup: {e}")
@@ -102,12 +103,12 @@ async def startup_event():
 async def shutdown_event():
     """Cleanup during shutdown"""
     try:
-        logger.info("Shutting down News API application...")
+        logger.info("Shutting down Business News API application...")
         
         # Stop the scheduler
         news_fetcher.stop_scheduler()
         
-        logger.info("News API application shut down successfully")
+        logger.info("Business News API application shut down successfully")
         
     except Exception as e:
         logger.error(f"Error during shutdown: {e}")
@@ -117,17 +118,26 @@ async def shutdown_event():
 async def root():
     """Welcome endpoint with API information"""
     return {
-        "message": "Welcome to the News API",
+        "message": "Welcome to the Business News API",
         "version": os.getenv('API_VERSION', '1.0.0'),
-        "description": os.getenv('API_DESCRIPTION', 'Business News API with automated caching'),
+        "description": os.getenv('API_DESCRIPTION', 'Business News API with automated multi-page caching'),
+        "features": [
+            "Multi-page news fetching (5 pages per cycle)",
+            "Automatic 2-hour refresh intervals",
+            "Smart article ordering (newest first)",
+            "Database cleanup (max 300 articles)",
+            "Full-text content storage"
+        ],
         "endpoints": {
-            "articles": "/articles - Get paginated news articles",
-            "article_detail": "/articles/{id} - Get specific article by ID",
-            "search": "/articles?search=query - Search articles",
-            "stats": "/stats - Get database statistics",
-            "health": "/health - Health check",
-            "scheduler": "/admin/scheduler - Get scheduler status",
-            "manual_fetch": "/admin/fetch - Manually trigger news fetch"
+            "articles": "/articles - Get paginated business news articles",
+            "article_detail": "/articles/{id} - Get specific article with full content",
+            "search": "/articles?search=query - Search articles by title and summary",
+            "latest": "/latest?limit=10 - Get latest articles quickly",
+            "stats": "/stats - Get database and API statistics",
+            "health": "/health - Health check endpoint",
+            "scheduler": "/admin/scheduler - Get scheduler status (Admin)",
+            "manual_fetch": "/admin/fetch - Manually trigger news fetch (Admin)",
+            "cleanup": "/admin/cleanup - Manually trigger cleanup (Admin)"
         },
         "documentation": "/docs - Interactive API documentation"
     }
@@ -148,7 +158,13 @@ async def health_check():
             "timestamp": datetime.now().isoformat(),
             "database": "connected" if stats else "error",
             "scheduler": "running" if scheduler_status.get('scheduler_running', False) else "stopped",
-            "total_articles": stats.get('total_articles', 0)
+            "total_articles": stats.get('total_articles', 0),
+            "max_articles": stats.get('max_articles', 300),
+            "api_info": {
+                "fetch_interval": "2 hours",
+                "pages_per_fetch": 5,
+                "category": "BUSINESS"
+            }
         }
     except Exception as e:
         logger.error(f"Health check failed: {e}")
@@ -163,7 +179,7 @@ async def get_articles(
     date_from: Optional[str] = Query(None, description="Filter from date (YYYY-MM-DD)"),
     date_to: Optional[str] = Query(None, description="Filter to date (YYYY-MM-DD)")
 ):
-    """Get paginated news articles with optional filtering"""
+    """Get paginated business news articles with optional filtering"""
     try:
         result = db.get_articles(
             page=page,
@@ -184,7 +200,7 @@ async def get_articles(
 async def get_article(
     article_id: int = Path(..., ge=1, description="Article ID")
 ):
-    """Get a specific article by ID"""
+    """Get a specific article by ID with full content"""
     try:
         article = db.get_article_by_id(article_id)
         
@@ -238,7 +254,7 @@ async def get_scheduler_status():
 # Admin endpoint - Manual news fetch
 @app.post("/admin/fetch", response_model=ManualFetchResponse)
 async def manual_fetch():
-    """Manually trigger news fetch (Admin endpoint)"""
+    """Manually trigger multi-page news fetch (Admin endpoint)"""
     try:
         result = news_fetcher.manual_fetch()
         
@@ -258,12 +274,22 @@ async def manual_fetch():
 async def manual_cleanup():
     """Manually trigger database cleanup (Admin endpoint)"""
     try:
-        deleted_count = db.cleanup_old_articles()
+        # Clean old articles
+        old_deleted = db.cleanup_old_articles()
+        
+        # Clean excess articles
+        excess_deleted = db.cleanup_excess_articles()
+        
+        total_deleted = old_deleted + excess_deleted
         
         return {
             "status": "success",
             "message": f"Cleanup completed successfully",
-            "deleted_articles": deleted_count
+            "deleted_articles": {
+                "old_articles": old_deleted,
+                "excess_articles": excess_deleted,
+                "total_deleted": total_deleted
+            }
         }
     
     except Exception as e:
@@ -275,13 +301,34 @@ async def manual_cleanup():
 async def get_latest_articles(
     limit: int = Query(10, ge=1, le=50, description="Number of latest articles")
 ):
-    """Get latest articles (convenience endpoint)"""
+    """Get latest business news articles (convenience endpoint)"""
     try:
         result = db.get_articles(page=1, limit=limit)
         return result['articles']
     
     except Exception as e:
         logger.error(f"Error getting latest articles: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+# Search endpoint (convenience)
+@app.get("/search", response_model=PaginatedResponse)
+async def search_articles(
+    q: str = Query(..., description="Search query"),
+    page: int = Query(1, ge=1, description="Page number"),
+    limit: int = Query(DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE, description="Items per page")
+):
+    """Search business news articles (convenience endpoint)"""
+    try:
+        result = db.get_articles(
+            page=page,
+            limit=limit,
+            search=q
+        )
+        
+        return PaginatedResponse(**result)
+    
+    except Exception as e:
+        logger.error(f"Error searching articles: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
 # Custom exception handler

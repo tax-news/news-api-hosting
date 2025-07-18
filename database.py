@@ -14,6 +14,8 @@ class DatabaseManager:
         self.db_path = os.getenv('DATABASE_PATH', 'news.db')
         self.timeout = int(os.getenv('DATABASE_TIMEOUT', '30'))
         self.retention_days = int(os.getenv('DATA_RETENTION_DAYS', '3'))
+        self.max_articles = int(os.getenv('MAX_ARTICLES_COUNT', '300'))
+        self.cleanup_count = int(os.getenv('CLEANUP_COUNT', '50'))
         self.init_database()
     
     @contextmanager
@@ -46,7 +48,8 @@ class DatabaseManager:
                     category TEXT DEFAULT 'business',
                     full_content TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    fetch_order INTEGER DEFAULT 0
                 )
             ''')
             
@@ -57,6 +60,7 @@ class DatabaseManager:
                     response_code INTEGER,
                     response_time REAL,
                     articles_fetched INTEGER,
+                    page_number INTEGER DEFAULT 1,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
@@ -66,18 +70,19 @@ class DatabaseManager:
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_published_date ON news_articles(published_date)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_url ON news_articles(url)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_category ON news_articles(category)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_fetch_order ON news_articles(fetch_order)')
             
             conn.commit()
     
-    def insert_article(self, article_data: Dict[str, Any]) -> bool:
+    def insert_article(self, article_data: Dict[str, Any], fetch_order: int = 0) -> bool:
         """Insert a new article into the database"""
         try:
             with self.get_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute('''
                     INSERT OR REPLACE INTO news_articles 
-                    (title, url, publisher, published_date, summary, thumbnail, language, category, full_content, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    (title, url, publisher, published_date, summary, thumbnail, language, category, full_content, fetch_order, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                 ''', (
                     article_data.get('title', ''),
                     article_data.get('url', ''),
@@ -87,7 +92,8 @@ class DatabaseManager:
                     article_data.get('thumbnail', ''),
                     article_data.get('language', os.getenv('NEWS_LANGUAGE', 'en-US')),
                     article_data.get('category', 'business'),
-                    article_data.get('full_content', '')
+                    article_data.get('full_content', ''),
+                    fetch_order
                 ))
                 conn.commit()
                 return True
@@ -95,7 +101,7 @@ class DatabaseManager:
             print(f"Database error inserting article: {e}")
             return False
     
-    def bulk_insert_articles(self, articles: List[Dict[str, Any]]) -> int:
+    def bulk_insert_articles(self, articles: List[Dict[str, Any]], fetch_order: int = 0) -> int:
         """Insert multiple articles in a single transaction"""
         inserted_count = 0
         try:
@@ -105,8 +111,8 @@ class DatabaseManager:
                     try:
                         cursor.execute('''
                             INSERT OR REPLACE INTO news_articles 
-                            (title, url, publisher, published_date, summary, thumbnail, language, category, full_content, updated_at)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                            (title, url, publisher, published_date, summary, thumbnail, language, category, full_content, fetch_order, updated_at)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                         ''', (
                             article.get('title', ''),
                             article.get('url', ''),
@@ -116,7 +122,8 @@ class DatabaseManager:
                             article.get('thumbnail', ''),
                             article.get('language', os.getenv('NEWS_LANGUAGE', 'en-US')),
                             article.get('category', 'business'),
-                            article.get('full_content', '')
+                            article.get('full_content', ''),
+                            fetch_order
                         ))
                         inserted_count += 1
                     except sqlite3.Error as e:
@@ -158,13 +165,13 @@ class DatabaseManager:
                 cursor.execute(f"SELECT COUNT(*) FROM news_articles WHERE {where_clause}", params)
                 total_count = cursor.fetchone()[0]
                 
-                # Get articles
+                # Get articles - ordered by fetch_order DESC, then created_at DESC for newest first
                 cursor.execute(f'''
                     SELECT id, title, url, publisher, published_date, summary, thumbnail, 
                            language, category, created_at, updated_at
                     FROM news_articles 
                     WHERE {where_clause}
-                    ORDER BY created_at DESC 
+                    ORDER BY fetch_order DESC, created_at DESC 
                     LIMIT ? OFFSET ?
                 ''', params + [limit, offset])
                 
@@ -245,15 +252,48 @@ class DatabaseManager:
             print(f"Database error during cleanup: {e}")
             return 0
     
-    def log_api_call(self, endpoint: str, response_code: int, response_time: float, articles_fetched: int):
+    def cleanup_excess_articles(self) -> int:
+        """Remove oldest articles when count exceeds max_articles"""
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                
+                # Get current count
+                cursor.execute('SELECT COUNT(*) FROM news_articles')
+                total_count = cursor.fetchone()[0]
+                
+                if total_count > self.max_articles:
+                    # Delete oldest articles (by created_at) to maintain max count
+                    articles_to_delete = total_count - self.max_articles + self.cleanup_count
+                    
+                    cursor.execute('''
+                        DELETE FROM news_articles 
+                        WHERE id IN (
+                            SELECT id FROM news_articles 
+                            ORDER BY created_at ASC 
+                            LIMIT ?
+                        )
+                    ''', (articles_to_delete,))
+                    
+                    deleted_count = cursor.rowcount
+                    conn.commit()
+                    print(f"Cleaned up {deleted_count} excess articles (total was {total_count})")
+                    return deleted_count
+                
+                return 0
+        except sqlite3.Error as e:
+            print(f"Database error during excess cleanup: {e}")
+            return 0
+    
+    def log_api_call(self, endpoint: str, response_code: int, response_time: float, articles_fetched: int, page_number: int = 1):
         """Log API call statistics"""
         try:
             with self.get_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute('''
-                    INSERT INTO api_logs (endpoint, response_code, response_time, articles_fetched)
-                    VALUES (?, ?, ?, ?)
-                ''', (endpoint, response_code, response_time, articles_fetched))
+                    INSERT INTO api_logs (endpoint, response_code, response_time, articles_fetched, page_number)
+                    VALUES (?, ?, ?, ?, ?)
+                ''', (endpoint, response_code, response_time, articles_fetched, page_number))
                 conn.commit()
         except sqlite3.Error as e:
             print(f"Database error logging API call: {e}")
@@ -285,7 +325,8 @@ class DatabaseManager:
                     'latest_article_date': latest_article,
                     'oldest_article_date': oldest_article,
                     'recent_api_calls_24h': recent_api_calls,
-                    'retention_days': self.retention_days
+                    'retention_days': self.retention_days,
+                    'max_articles': self.max_articles
                 }
         except sqlite3.Error as e:
             print(f"Database error getting stats: {e}")

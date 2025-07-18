@@ -33,14 +33,17 @@ class NewsAPIError(Exception):
 class NewsFetcher:
     def __init__(self):
         self.rapidapi_key = os.getenv('RAPIDAPI_KEY')
-        self.rapidapi_host = os.getenv('RAPIDAPI_HOST', 'newsnow.p.rapidapi.com')
-        self.news_endpoint = os.getenv('NEWS_ENDPOINT', '/news')
-        self.news_language = os.getenv('NEWS_LANGUAGE', 'en')
-        self.news_category = os.getenv('NEWS_CATEGORY', 'business')
+        self.rapidapi_host = os.getenv('RAPIDAPI_HOST', 'reuters-api.p.rapidapi.com')
         self.connection_timeout = int(os.getenv('CONNECTION_TIMEOUT', '30'))
         self.read_timeout = int(os.getenv('READ_TIMEOUT', '30'))
         self.max_retries = int(os.getenv('MAX_RETRIES', '3'))
-        self.max_pages = int(os.getenv('MAX_PAGES', '3'))  # Reduced to 3 pages
+        
+        # Reuters categories to fetch from
+        self.reuters_categories = [
+            'https%3A%2F%2Fwww.reuters.com%2Fbusiness%2F',
+            'https%3A%2F%2Fwww.reuters.com%2Ftechnology%2F',
+            'https%3A%2F%2Fwww.reuters.com%2Fmarkets%2F'
+        ]
         
         if not self.rapidapi_key:
             raise ValueError("RAPIDAPI_KEY is required in environment variables")
@@ -57,7 +60,7 @@ class NewsFetcher:
                 func=self.fetch_and_store_news,
                 trigger=IntervalTrigger(hours=fetch_interval),
                 id='fetch_news',
-                name='Fetch News from API',
+                name='Fetch News from Reuters API',
                 replace_existing=True
             )
             
@@ -101,263 +104,195 @@ class NewsFetcher:
         except Exception as e:
             logger.error(f"Error stopping scheduler: {e}")
     
-    def fetch_news_from_api(self, page: int = 1) -> Optional[Dict[str, Any]]:
-        """Fetch news from external API with retry logic"""
+    def fetch_news_from_reuters(self, category_url: str) -> Optional[Dict[str, Any]]:
+        """Fetch news from Reuters API for a specific category"""
         headers = {
             'x-rapidapi-key': self.rapidapi_key,
             'x-rapidapi-host': self.rapidapi_host
         }
         
-        # Try different endpoint formats
-        endpoints_to_try = [
-            f"/news?category={self.news_category}&language={self.news_language}&page={page}",
-            f"/news?category={self.news_category}&page={page}",
-            f"/newsv2_top_news_cat"
-        ]
+        endpoint_url = f"/category?url={category_url}"
         
-        for endpoint_url in endpoints_to_try:
-            logger.info(f"Trying endpoint: {endpoint_url}")
+        for attempt in range(self.max_retries):
+            start_time = time.time()
+            conn = None
             
-            for attempt in range(self.max_retries):
-                start_time = time.time()
-                conn = None
+            try:
+                logger.info(f"Fetching news from Reuters API: {category_url} (attempt {attempt + 1}/{self.max_retries})")
                 
-                try:
-                    logger.info(f"Fetching news from {endpoint_url} (attempt {attempt + 1}/{self.max_retries})")
-                    
-                    conn = http.client.HTTPSConnection(self.rapidapi_host, timeout=self.connection_timeout)
-                    
-                    # Try GET first
-                    if "newsv2_top_news_cat" in endpoint_url:
-                        # Use POST for this specific endpoint
-                        payload = json.dumps({
-                            "category": self.news_category.upper(),
-                            "location": "",
-                            "language": self.news_language,
-                            "page": page
-                        })
-                        headers['Content-Type'] = 'application/json'
-                        conn.request("POST", endpoint_url, payload, headers)
-                    else:
-                        # Use GET for other endpoints
-                        if 'Content-Type' in headers:
-                            del headers['Content-Type']
-                        conn.request("GET", endpoint_url, headers=headers)
-                    
-                    response = conn.getresponse()
-                    response_time = time.time() - start_time
-                    
-                    if response.status == 200:
-                        data = response.read()
-                        response_data = json.loads(data.decode("utf-8"))
-                        
-                        logger.info(f"Successfully fetched news data from {endpoint_url} in {response_time:.2f}s")
-                        
-                        # Log successful API call
-                        articles_count = self.count_articles_in_response(response_data)
-                        db.log_api_call(endpoint_url, response.status, response_time, articles_count, page)
-                        
-                        return response_data
-                    
-                    elif response.status == 429:
-                        logger.warning(f"Rate limit exceeded (429). Attempt {attempt + 1}")
-                        if attempt < self.max_retries - 1:
-                            wait_time = 2 ** attempt
-                            logger.info(f"Waiting {wait_time}s before retry...")
-                            time.sleep(wait_time)
-                        continue
-                    
-                    elif response.status == 404:
-                        logger.warning(f"Endpoint {endpoint_url} not found (404), trying next endpoint")
-                        db.log_api_call(endpoint_url, response.status, response_time, 0, page)
-                        break  # Try next endpoint
-                    
-                    else:
-                        error_msg = f"API request failed with status {response.status}"
-                        logger.error(error_msg)
-                        db.log_api_call(endpoint_url, response.status, response_time, 0, page)
-                        
-                        if attempt < self.max_retries - 1:
-                            time.sleep(2 ** attempt)
-                            continue
-                        else:
-                            break  # Try next endpoint
+                conn = http.client.HTTPSConnection(self.rapidapi_host, timeout=self.connection_timeout)
+                conn.request("GET", endpoint_url, headers=headers)
                 
-                except json.JSONDecodeError as e:
-                    logger.error(f"JSON decode error: {e}")
+                response = conn.getresponse()
+                response_time = time.time() - start_time
+                
+                if response.status == 200:
+                    data = response.read()
+                    response_data = json.loads(data.decode("utf-8"))
+                    
+                    logger.info(f"Successfully fetched Reuters data in {response_time:.2f}s")
+                    
+                    # Log successful API call
+                    articles_count = len(response_data) if isinstance(response_data, list) else 0
+                    db.log_api_call(endpoint_url, response.status, response_time, articles_count, 1)
+                    
+                    return response_data
+                
+                elif response.status == 429:
+                    logger.warning(f"Rate limit exceeded (429). Attempt {attempt + 1}")
+                    if attempt < self.max_retries - 1:
+                        wait_time = 2 ** attempt
+                        logger.info(f"Waiting {wait_time}s before retry...")
+                        time.sleep(wait_time)
+                    continue
+                
+                else:
+                    error_msg = f"Reuters API request failed with status {response.status}"
+                    logger.error(error_msg)
+                    
+                    # Log failed API call
+                    db.log_api_call(endpoint_url, response.status, response_time, 0, 1)
+                    
                     if attempt < self.max_retries - 1:
                         time.sleep(2 ** attempt)
                         continue
                     else:
-                        break  # Try next endpoint
-                
-                except Exception as e:
-                    logger.error(f"Connection error: {e}")
-                    if attempt < self.max_retries - 1:
-                        time.sleep(2 ** attempt)
-                        continue
-                    else:
-                        break  # Try next endpoint
-                
-                finally:
-                    if conn:
-                        conn.close()
+                        raise NewsAPIError(error_msg)
+            
+            except json.JSONDecodeError as e:
+                logger.error(f"JSON decode error: {e}")
+                if attempt < self.max_retries - 1:
+                    time.sleep(2 ** attempt)
+                    continue
+                else:
+                    raise NewsAPIError(f"Invalid JSON response: {e}")
+            
+            except Exception as e:
+                logger.error(f"Connection error: {e}")
+                if attempt < self.max_retries - 1:
+                    time.sleep(2 ** attempt)
+                    continue
+                else:
+                    raise NewsAPIError(f"Connection failed after {self.max_retries} attempts: {e}")
+            
+            finally:
+                if conn:
+                    conn.close()
         
-        logger.error("All endpoints failed")
         return None
     
-    def count_articles_in_response(self, raw_data: Dict[str, Any]) -> int:
-        """Count articles in response data"""
-        if isinstance(raw_data, dict):
-            # Try different response formats
-            if 'count' in raw_data:
-                return raw_data.get('count', 0)
-            elif 'articles' in raw_data:
-                return len(raw_data.get('articles', []))
-            elif 'data' in raw_data:
-                return len(raw_data.get('data', []))
-            else:
-                # Count news items in NewsNow format
-                count = 0
-                i = 0
-                while f"news:{i}:" in str(raw_data):
-                    count += 1
-                    i += 1
-                return count
-        return 0
-    
-    def parse_news_data(self, raw_data: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """Parse and normalize news data from API response"""
+    def parse_reuters_data(self, raw_data: Any, category: str) -> List[Dict[str, Any]]:
+        """Parse and normalize news data from Reuters API response"""
         articles = []
         
         try:
-            if not isinstance(raw_data, dict):
-                logger.warning("Unexpected response format")
+            if not isinstance(raw_data, list):
+                logger.warning("Unexpected Reuters response format - expected list")
                 return articles
             
-            # Handle different response formats
-            if 'articles' in raw_data:
-                # Standard news API format
-                news_items = raw_data.get('articles', [])
-                logger.info(f"Processing {len(news_items)} articles from standard format")
-                
-                for item in news_items:
-                    article = {
-                        'title': item.get('title', '').strip(),
-                        'url': item.get('url', '').strip(),
-                        'publisher': item.get('source', {}).get('name', '').strip() if isinstance(item.get('source'), dict) else item.get('publisher', '').strip(),
-                        'published_date': item.get('publishedAt', '').strip(),
-                        'summary': item.get('description', '').strip(),
-                        'thumbnail': item.get('urlToImage', '').strip(),
-                        'language': self.news_language,
-                        'category': 'business',
-                        'full_content': item.get('content', '').strip()
-                    }
-                    
-                    if article['title'] and article['url']:
-                        articles.append(article)
+            logger.info(f"Processing {len(raw_data)} Reuters articles from {category}")
             
-            elif 'count' in raw_data:
-                # NewsNow API format
-                count = raw_data.get('count', 0)
-                if count == 0:
-                    logger.warning("No articles found in API response")
-                    return articles
-                
-                logger.info(f"Processing {count} news items from NewsNow format")
-                
-                for i in range(count):
-                    news_key = f"news:{i}:"
+            for item in raw_data:
+                try:
+                    if not isinstance(item, dict):
+                        continue
                     
-                    title = raw_data.get(f"{news_key}title", "").strip().strip('"')
-                    url = raw_data.get(f"{news_key}url", "").strip().strip('"')
-                    top_image = raw_data.get(f"{news_key}top_image", "").strip().strip('"')
-                    date = raw_data.get(f"{news_key}date", "").strip().strip('"')
-                    short_description = raw_data.get(f"{news_key}short_description", "").strip().strip('"')
-                    text = raw_data.get(f"{news_key}text", "").strip().strip('"')
+                    # Extract article data from Reuters format
+                    title = item.get('title', '').strip()
+                    url = item.get('url', '').strip()
+                    summary = item.get('summary', '').strip() or item.get('description', '').strip()
+                    published_date = item.get('published_date', '').strip() or item.get('date', '').strip()
+                    thumbnail = item.get('image', '').strip() or item.get('thumbnail', '').strip()
+                    author = item.get('author', '').strip()
                     
-                    publisher_href = raw_data.get(f"{news_key}publisher:href", "").strip().strip('"')
-                    publisher_title = raw_data.get(f"{news_key}publisher:title", "").strip().strip('"')
-                    
+                    # Skip articles with missing essential fields
                     if not title or not url:
                         logger.warning(f"Skipping article with missing title or URL")
                         continue
                     
-                    # Convert date format if possible
-                    published_date = date
-                    if date:
+                    # Convert date format if needed
+                    formatted_date = published_date
+                    if published_date:
                         try:
-                            dt = datetime.strptime(date, '%a, %d %b %Y %H:%M:%S %Z')
-                            published_date = dt.strftime('%Y-%m-%d %H:%M:%S')
-                        except (ValueError, TypeError) as e:
-                            logger.debug(f"Could not parse date {date}: {e}")
-                            published_date = date
+                            # Try to parse various date formats
+                            for date_format in ['%Y-%m-%dT%H:%M:%SZ', '%Y-%m-%d %H:%M:%S', '%Y-%m-%d']:
+                                try:
+                                    dt = datetime.strptime(published_date, date_format)
+                                    formatted_date = dt.strftime('%Y-%m-%d %H:%M:%S')
+                                    break
+                                except ValueError:
+                                    continue
+                        except Exception as e:
+                            logger.debug(f"Could not parse date {published_date}: {e}")
+                            formatted_date = published_date
                     
+                    # Create normalized article
                     article = {
                         'title': title,
                         'url': url,
-                        'publisher': publisher_title or publisher_href,
-                        'published_date': published_date,
-                        'summary': short_description or text[:200] + "..." if text else "",
-                        'thumbnail': top_image,
-                        'language': self.news_language,
+                        'publisher': 'Reuters',
+                        'published_date': formatted_date,
+                        'summary': summary,
+                        'thumbnail': thumbnail,
+                        'language': 'en',
                         'category': 'business',
-                        'full_content': text
+                        'full_content': item.get('content', '').strip() or summary
                     }
                     
                     articles.append(article)
-                    logger.debug(f"Added article: {title[:50]}...")
+                    logger.debug(f"Added Reuters article: {title[:50]}...")
+                    
+                except Exception as e:
+                    logger.warning(f"Error parsing Reuters article: {e}")
+                    continue
             
-            else:
-                # Try to handle other formats
-                logger.warning("Unknown response format, trying to extract data")
-                logger.debug(f"Response keys: {list(raw_data.keys())}")
-            
-            logger.info(f"Successfully parsed {len(articles)} articles")
+            logger.info(f"Successfully parsed {len(articles)} Reuters articles")
             return articles
             
         except Exception as e:
-            logger.error(f"Error parsing news data: {e}")
+            logger.error(f"Error parsing Reuters data: {e}")
             return []
     
     def fetch_and_store_news(self):
-        """Main function to fetch news from multiple pages and store in database"""
+        """Main function to fetch news from Reuters and store in database"""
         try:
-            logger.info("Starting multi-page news fetch and store process")
+            logger.info("Starting Reuters news fetch and store process")
             
             total_articles = 0
             fetch_timestamp = int(time.time())
             
-            # Fetch pages in reverse order (3, 2, 1) for better ordering
-            for page in range(self.max_pages, 0, -1):
+            # Fetch from different Reuters categories
+            for i, category_url in enumerate(self.reuters_categories):
                 try:
-                    logger.info(f"Fetching page {page}/{self.max_pages}")
+                    category_name = category_url.split('%2F')[-2] if '%2F' in category_url else f"category_{i+1}"
+                    logger.info(f"Fetching from Reuters category: {category_name}")
                     
-                    # Fetch news from API
-                    raw_data = self.fetch_news_from_api(page)
+                    # Fetch news from Reuters API
+                    raw_data = self.fetch_news_from_reuters(category_url)
                     if not raw_data:
-                        logger.warning(f"No data received from API for page {page}")
+                        logger.warning(f"No data received from Reuters API for {category_name}")
                         continue
                     
                     # Parse the data
-                    articles = self.parse_news_data(raw_data)
+                    articles = self.parse_reuters_data(raw_data, category_name)
                     if not articles:
-                        logger.warning(f"No articles parsed from API response for page {page}")
+                        logger.warning(f"No articles parsed from Reuters response for {category_name}")
                         continue
                     
                     # Store articles in database with fetch order
-                    page_fetch_order = fetch_timestamp + (page * 1000)
-                    inserted_count = db.bulk_insert_articles(articles, page_fetch_order)
+                    # Higher category index gets higher fetch_order so newer categories appear first
+                    category_fetch_order = fetch_timestamp + ((len(self.reuters_categories) - i) * 1000)
+                    inserted_count = db.bulk_insert_articles(articles, category_fetch_order)
                     
                     total_articles += inserted_count
-                    logger.info(f"Page {page}: Stored {inserted_count} articles")
+                    logger.info(f"Category {category_name}: Stored {inserted_count} articles")
                     
-                    # Small delay between pages
-                    if page > 1:
-                        time.sleep(2)
+                    # Delay between categories to avoid rate limits
+                    if i < len(self.reuters_categories) - 1:
+                        time.sleep(3)
                         
                 except Exception as e:
-                    logger.error(f"Error processing page {page}: {e}")
+                    logger.error(f"Error processing Reuters category {i+1}: {e}")
                     continue
             
             logger.info(f"Total articles stored in this fetch: {total_articles}")
@@ -416,9 +351,9 @@ class NewsFetcher:
     def manual_fetch(self) -> Dict[str, Any]:
         """Manually trigger news fetch (for testing/admin purposes)"""
         try:
-            logger.info("Manual news fetch triggered")
+            logger.info("Manual Reuters news fetch triggered")
             self.fetch_and_store_news()
-            return {'status': 'success', 'message': 'News fetch completed successfully'}
+            return {'status': 'success', 'message': 'Reuters news fetch completed successfully'}
         except Exception as e:
             logger.error(f"Manual fetch failed: {e}")
             return {'status': 'error', 'message': str(e)}

@@ -74,44 +74,61 @@ class NewsFetcher:
     
     def fetch_news_page(self, page: int) -> Optional[str]:
         """Fetch news from NewsNow API - your exact working code"""
-        try:
-            conn = http.client.HTTPSConnection("newsnow.p.rapidapi.com")
-            
-            payload = json.dumps({
-                "category": "BUSINESS",
-                "location": "in", 
-                "language": "en",
-                "page": page
-            })
-            
-            headers = {
-                'x-rapidapi-key': self.rapidapi_key,
-                'x-rapidapi-host': "newsnow.p.rapidapi.com",
-                'Content-Type': "application/json"
-            }
-            
-            logger.info(f"Fetching page {page} from NewsNow API")
-            
-            conn.request("POST", "/newsv2_top_news_cat", payload, headers)
-            res = conn.getresponse()
-            
-            if res.status == 200:
-                data = res.read()
-                response_text = data.decode("utf-8")
-                logger.info(f"Successfully fetched page {page}")
-                return response_text
-            else:
-                logger.error(f"API error: {res.status}")
-                return None
-                
-        except Exception as e:
-            logger.error(f"Error fetching page {page}: {e}")
-            return None
-        finally:
+        max_retries = 3
+        
+        for attempt in range(max_retries):
             try:
-                conn.close()
-            except:
-                pass
+                conn = http.client.HTTPSConnection("newsnow.p.rapidapi.com")
+                
+                payload = json.dumps({
+                    "category": "BUSINESS",
+                    "location": "in", 
+                    "language": "en",
+                    "page": page
+                })
+                
+                headers = {
+                    'x-rapidapi-key': self.rapidapi_key,
+                    'x-rapidapi-host': "newsnow.p.rapidapi.com",
+                    'Content-Type': "application/json"
+                }
+                
+                logger.info(f"Fetching page {page} from NewsNow API (attempt {attempt + 1})")
+                
+                conn.request("POST", "/newsv2_top_news_cat", payload, headers)
+                res = conn.getresponse()
+                
+                if res.status == 200:
+                    data = res.read()
+                    response_text = data.decode("utf-8")
+                    logger.info(f"Successfully fetched page {page}")
+                    return response_text
+                elif res.status == 429:
+                    wait_time = (2 ** attempt) * 2  # Exponential backoff: 2s, 4s, 8s
+                    logger.warning(f"Rate limit hit (429) for page {page}, attempt {attempt + 1}. Waiting {wait_time}s...")
+                    if attempt < max_retries - 1:
+                        time.sleep(wait_time)
+                        continue
+                    else:
+                        logger.error(f"Rate limit exceeded for page {page} after {max_retries} attempts")
+                        return None
+                else:
+                    logger.error(f"API error: {res.status}")
+                    return None
+                    
+            except Exception as e:
+                logger.error(f"Error fetching page {page}: {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(2)
+                    continue
+                return None
+            finally:
+                try:
+                    conn.close()
+                except:
+                    pass
+        
+        return None
     
     def parse_response(self, response_text: str) -> List[Dict[str, Any]]:
         """Parse your exact response format"""
@@ -312,19 +329,23 @@ class NewsFetcher:
             fetch_timestamp = int(time.time())
             max_pages = int(os.getenv('MAX_PAGES', '3'))
             
-            # Fetch pages in reverse order (3, 2, 1)
+            # Fetch pages in reverse order (3, 2, 1) with longer delays
             for page in range(max_pages, 0, -1):
                 try:
                     # Fetch page
                     response_text = self.fetch_news_page(page)
                     if not response_text:
                         logger.warning(f"No response from page {page}")
+                        # Wait longer before trying next page if rate limited
+                        time.sleep(5)
                         continue
                     
                     # Parse articles
                     articles = self.parse_response(response_text)
                     if not articles:
                         logger.warning(f"No articles parsed from page {page}")
+                        # Still wait to avoid rate limits
+                        time.sleep(3)
                         continue
                     
                     # Store articles
@@ -334,12 +355,16 @@ class NewsFetcher:
                     total_articles += inserted_count
                     logger.info(f"Page {page}: Stored {inserted_count} articles")
                     
-                    # Delay between pages
+                    # Always wait between pages to respect rate limits
                     if page > 1:
-                        time.sleep(2)
+                        wait_time = 5  # 5 seconds between pages
+                        logger.info(f"Waiting {wait_time}s before next page...")
+                        time.sleep(wait_time)
                         
                 except Exception as e:
                     logger.error(f"Error processing page {page}: {e}")
+                    # Wait even on error to avoid hammering the API
+                    time.sleep(3)
                     continue
             
             logger.info(f"Total articles stored: {total_articles}")

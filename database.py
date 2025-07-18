@@ -35,6 +35,8 @@ class DatabaseManager:
         """Initialize database and create tables"""
         with self.get_connection() as conn:
             cursor = conn.cursor()
+            
+            # Create main table
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS news_articles (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -52,14 +54,14 @@ class DatabaseManager:
                 )
             ''')
             
-            # Add fetch_order column if it doesn't exist (for existing databases)
+            # Add fetch_order column if it doesn't exist
             try:
                 cursor.execute('ALTER TABLE news_articles ADD COLUMN fetch_order INTEGER DEFAULT 0')
                 print("Added fetch_order column to existing database")
             except sqlite3.OperationalError:
-                # Column already exists, ignore the error
-                pass
+                pass  # Column already exists
             
+            # Create api_logs table
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS api_logs (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -67,12 +69,17 @@ class DatabaseManager:
                     response_code INTEGER,
                     response_time REAL,
                     articles_fetched INTEGER,
-                    page_number INTEGER DEFAULT 1,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
             
-            # Create indexes for better performance
+            # Add page_number column if it doesn't exist
+            try:
+                cursor.execute('ALTER TABLE api_logs ADD COLUMN page_number INTEGER DEFAULT 1')
+            except sqlite3.OperationalError:
+                pass  # Column already exists
+            
+            # Create indexes
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_created_at ON news_articles(created_at)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_published_date ON news_articles(published_date)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_url ON news_articles(url)')
@@ -82,7 +89,6 @@ class DatabaseManager:
             try:
                 cursor.execute('CREATE INDEX IF NOT EXISTS idx_fetch_order ON news_articles(fetch_order)')
             except sqlite3.OperationalError:
-                # Column doesn't exist yet, skip index creation
                 pass
             
             conn.commit()
@@ -110,7 +116,7 @@ class DatabaseManager:
                         article_data.get('published_date', ''),
                         article_data.get('summary', ''),
                         article_data.get('thumbnail', ''),
-                        article_data.get('language', os.getenv('NEWS_LANGUAGE', 'en-US')),
+                        article_data.get('language', os.getenv('NEWS_LANGUAGE', 'en')),
                         article_data.get('category', 'business'),
                         article_data.get('full_content', ''),
                         fetch_order
@@ -127,7 +133,7 @@ class DatabaseManager:
                         article_data.get('published_date', ''),
                         article_data.get('summary', ''),
                         article_data.get('thumbnail', ''),
-                        article_data.get('language', os.getenv('NEWS_LANGUAGE', 'en-US')),
+                        article_data.get('language', os.getenv('NEWS_LANGUAGE', 'en')),
                         article_data.get('category', 'business'),
                         article_data.get('full_content', '')
                     ))
@@ -163,7 +169,7 @@ class DatabaseManager:
                                 article.get('published_date', ''),
                                 article.get('summary', ''),
                                 article.get('thumbnail', ''),
-                                article.get('language', os.getenv('NEWS_LANGUAGE', 'en-US')),
+                                article.get('language', os.getenv('NEWS_LANGUAGE', 'en')),
                                 article.get('category', 'business'),
                                 article.get('full_content', ''),
                                 fetch_order
@@ -180,7 +186,7 @@ class DatabaseManager:
                                 article.get('published_date', ''),
                                 article.get('summary', ''),
                                 article.get('thumbnail', ''),
-                                article.get('language', os.getenv('NEWS_LANGUAGE', 'en-US')),
+                                article.get('language', os.getenv('NEWS_LANGUAGE', 'en')),
                                 article.get('category', 'business'),
                                 article.get('full_content', '')
                             ))
@@ -198,7 +204,6 @@ class DatabaseManager:
         """Get articles with pagination and optional filtering"""
         offset = (page - 1) * limit
         
-        # Build WHERE clause
         where_conditions = []
         params = []
         
@@ -229,7 +234,7 @@ class DatabaseManager:
                 cursor.execute(f"SELECT COUNT(*) FROM news_articles WHERE {where_clause}", params)
                 total_count = cursor.fetchone()[0]
                 
-                # Get articles - order by fetch_order if available, otherwise by created_at
+                # Order by fetch_order if available, otherwise by created_at
                 if has_fetch_order:
                     order_clause = "ORDER BY fetch_order DESC, created_at DESC"
                 else:
@@ -315,7 +320,8 @@ class DatabaseManager:
                 cursor.execute('DELETE FROM news_articles WHERE created_at < ?', (cutoff_str,))
                 deleted_count = cursor.rowcount
                 conn.commit()
-                print(f"Cleaned up {deleted_count} articles older than {self.retention_days} days")
+                if deleted_count > 0:
+                    print(f"Cleaned up {deleted_count} articles older than {self.retention_days} days")
                 return deleted_count
         except sqlite3.Error as e:
             print(f"Database error during cleanup: {e}")
@@ -327,12 +333,10 @@ class DatabaseManager:
             with self.get_connection() as conn:
                 cursor = conn.cursor()
                 
-                # Get current count
                 cursor.execute('SELECT COUNT(*) FROM news_articles')
                 total_count = cursor.fetchone()[0]
                 
                 if total_count > self.max_articles:
-                    # Delete oldest articles (by created_at) to maintain max count
                     articles_to_delete = total_count - self.max_articles + self.cleanup_count
                     
                     cursor.execute('''
@@ -346,7 +350,8 @@ class DatabaseManager:
                     
                     deleted_count = cursor.rowcount
                     conn.commit()
-                    print(f"Cleaned up {deleted_count} excess articles (total was {total_count})")
+                    if deleted_count > 0:
+                        print(f"Cleaned up {deleted_count} excess articles (total was {total_count})")
                     return deleted_count
                 
                 return 0
@@ -359,10 +364,22 @@ class DatabaseManager:
         try:
             with self.get_connection() as conn:
                 cursor = conn.cursor()
-                cursor.execute('''
-                    INSERT INTO api_logs (endpoint, response_code, response_time, articles_fetched, page_number)
-                    VALUES (?, ?, ?, ?, ?)
-                ''', (endpoint, response_code, response_time, articles_fetched, page_number))
+                
+                # Check if page_number column exists
+                cursor.execute("PRAGMA table_info(api_logs)")
+                columns = [column[1] for column in cursor.fetchall()]
+                has_page_number = 'page_number' in columns
+                
+                if has_page_number:
+                    cursor.execute('''
+                        INSERT INTO api_logs (endpoint, response_code, response_time, articles_fetched, page_number)
+                        VALUES (?, ?, ?, ?, ?)
+                    ''', (endpoint, response_code, response_time, articles_fetched, page_number))
+                else:
+                    cursor.execute('''
+                        INSERT INTO api_logs (endpoint, response_code, response_time, articles_fetched)
+                        VALUES (?, ?, ?, ?)
+                    ''', (endpoint, response_code, response_time, articles_fetched))
                 conn.commit()
         except sqlite3.Error as e:
             print(f"Database error logging API call: {e}")
@@ -373,19 +390,15 @@ class DatabaseManager:
             with self.get_connection() as conn:
                 cursor = conn.cursor()
                 
-                # Get article count
                 cursor.execute('SELECT COUNT(*) FROM news_articles')
                 article_count = cursor.fetchone()[0]
                 
-                # Get latest article date
                 cursor.execute('SELECT MAX(created_at) FROM news_articles')
                 latest_article = cursor.fetchone()[0]
                 
-                # Get oldest article date
                 cursor.execute('SELECT MIN(created_at) FROM news_articles')
                 oldest_article = cursor.fetchone()[0]
                 
-                # Get recent API calls
                 cursor.execute('SELECT COUNT(*) FROM api_logs WHERE created_at > datetime("now", "-1 day")')
                 recent_api_calls = cursor.fetchone()[0]
                 

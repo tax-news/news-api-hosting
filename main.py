@@ -118,11 +118,11 @@ async def shutdown_event():
 async def root():
     """Welcome endpoint with API information"""
     return {
-        "message": "Welcome to the Business News API",
+        "message": "Welcome to the Reuters Business News API",
         "version": os.getenv('API_VERSION', '1.0.0'),
-        "description": os.getenv('API_DESCRIPTION', 'Business News API with automated multi-page caching'),
+        "description": os.getenv('API_DESCRIPTION', 'Reuters Business News API with automated caching'),
         "features": [
-            "Multi-page news fetching (5 pages per cycle)",
+            "Reuters Business, Technology & Markets news",
             "Automatic 2-hour refresh intervals",
             "Smart article ordering (newest first)",
             "Database cleanup (max 300 articles)",
@@ -162,8 +162,8 @@ async def health_check():
             "max_articles": stats.get('max_articles', 300),
             "api_info": {
                 "fetch_interval": "2 hours",
-                "pages_per_fetch": 5,
-                "category": "BUSINESS"
+                "categories": "Business, Technology, Markets",
+                "source": "Reuters"
             }
         }
     except Exception as e:
@@ -179,7 +179,7 @@ async def get_articles(
     date_from: Optional[str] = Query(None, description="Filter from date (YYYY-MM-DD)"),
     date_to: Optional[str] = Query(None, description="Filter to date (YYYY-MM-DD)")
 ):
-    """Get paginated business news articles with optional filtering"""
+    """Get paginated Reuters business news articles with optional filtering"""
     try:
         result = db.get_articles(
             page=page,
@@ -254,7 +254,7 @@ async def get_scheduler_status():
 # Admin endpoint - Manual news fetch
 @app.post("/admin/fetch", response_model=ManualFetchResponse)
 async def manual_fetch():
-    """Manually trigger multi-page news fetch (Admin endpoint)"""
+    """Manually trigger Reuters news fetch (Admin endpoint)"""
     try:
         result = news_fetcher.manual_fetch()
         
@@ -301,7 +301,7 @@ async def manual_cleanup():
 async def get_latest_articles(
     limit: int = Query(10, ge=1, le=50, description="Number of latest articles")
 ):
-    """Get latest business news articles (convenience endpoint)"""
+    """Get latest Reuters business news articles (convenience endpoint)"""
     try:
         result = db.get_articles(page=1, limit=limit)
         return result['articles']
@@ -317,7 +317,7 @@ async def search_articles(
     page: int = Query(1, ge=1, description="Page number"),
     limit: int = Query(DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE, description="Items per page")
 ):
-    """Search business news articles (convenience endpoint)"""
+    """Search Reuters business news articles (convenience endpoint)"""
     try:
         result = db.get_articles(
             page=page,

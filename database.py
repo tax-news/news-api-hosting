@@ -33,7 +33,7 @@ class DatabaseManager:
         with self.get_connection() as conn:
             cursor = conn.cursor()
             
-            # Create articles table
+            # Create articles table without fetch_order first
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS news_articles (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -47,10 +47,17 @@ class DatabaseManager:
                     category TEXT DEFAULT 'business',
                     full_content TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    fetch_order INTEGER DEFAULT 0
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
+            
+            # Add fetch_order column if it doesn't exist
+            try:
+                cursor.execute('ALTER TABLE news_articles ADD COLUMN fetch_order INTEGER DEFAULT 0')
+                print("Added fetch_order column")
+            except sqlite3.OperationalError:
+                # Column already exists, ignore
+                pass
             
             # Create api_logs table
             cursor.execute('''
@@ -60,15 +67,27 @@ class DatabaseManager:
                     response_code INTEGER,
                     response_time REAL,
                     articles_fetched INTEGER,
-                    page_number INTEGER DEFAULT 1,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
             
-            # Create indexes
+            # Add page_number column if it doesn't exist
+            try:
+                cursor.execute('ALTER TABLE api_logs ADD COLUMN page_number INTEGER DEFAULT 1')
+            except sqlite3.OperationalError:
+                # Column already exists, ignore
+                pass
+            
+            # Create indexes safely
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_created_at ON news_articles(created_at)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_url ON news_articles(url)')
-            cursor.execute('CREATE INDEX IF NOT EXISTS idx_fetch_order ON news_articles(fetch_order)')
+            
+            # Only create fetch_order index if column exists
+            try:
+                cursor.execute('CREATE INDEX IF NOT EXISTS idx_fetch_order ON news_articles(fetch_order)')
+            except sqlite3.OperationalError:
+                # Column doesn't exist, skip index
+                pass
             
             conn.commit()
             print("Database initialized successfully")
@@ -79,25 +98,49 @@ class DatabaseManager:
         try:
             with self.get_connection() as conn:
                 cursor = conn.cursor()
+                
+                # Check if fetch_order column exists
+                cursor.execute("PRAGMA table_info(news_articles)")
+                columns = [column[1] for column in cursor.fetchall()]
+                has_fetch_order = 'fetch_order' in columns
+                
                 for article in articles:
                     try:
-                        cursor.execute('''
-                            INSERT OR REPLACE INTO news_articles 
-                            (title, url, publisher, published_date, summary, thumbnail, 
-                             language, category, full_content, fetch_order, updated_at)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-                        ''', (
-                            article.get('title', ''),
-                            article.get('url', ''),
-                            article.get('publisher', ''),
-                            article.get('published_date', ''),
-                            article.get('summary', ''),
-                            article.get('thumbnail', ''),
-                            article.get('language', 'en'),
-                            article.get('category', 'business'),
-                            article.get('full_content', ''),
-                            fetch_order
-                        ))
+                        if has_fetch_order:
+                            cursor.execute('''
+                                INSERT OR REPLACE INTO news_articles 
+                                (title, url, publisher, published_date, summary, thumbnail, 
+                                 language, category, full_content, fetch_order, updated_at)
+                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                            ''', (
+                                article.get('title', ''),
+                                article.get('url', ''),
+                                article.get('publisher', ''),
+                                article.get('published_date', ''),
+                                article.get('summary', ''),
+                                article.get('thumbnail', ''),
+                                article.get('language', 'en'),
+                                article.get('category', 'business'),
+                                article.get('full_content', ''),
+                                fetch_order
+                            ))
+                        else:
+                            cursor.execute('''
+                                INSERT OR REPLACE INTO news_articles 
+                                (title, url, publisher, published_date, summary, thumbnail, 
+                                 language, category, full_content, updated_at)
+                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                            ''', (
+                                article.get('title', ''),
+                                article.get('url', ''),
+                                article.get('publisher', ''),
+                                article.get('published_date', ''),
+                                article.get('summary', ''),
+                                article.get('thumbnail', ''),
+                                article.get('language', 'en'),
+                                article.get('category', 'business'),
+                                article.get('full_content', '')
+                            ))
                         inserted_count += 1
                     except sqlite3.Error as e:
                         print(f"Error inserting article: {e}")
@@ -133,17 +176,27 @@ class DatabaseManager:
             with self.get_connection() as conn:
                 cursor = conn.cursor()
                 
+                # Check if fetch_order column exists
+                cursor.execute("PRAGMA table_info(news_articles)")
+                columns = [column[1] for column in cursor.fetchall()]
+                has_fetch_order = 'fetch_order' in columns
+                
                 # Get total count
                 cursor.execute(f"SELECT COUNT(*) FROM news_articles WHERE {where_clause}", params)
                 total_count = cursor.fetchone()[0]
                 
-                # Get articles
+                # Get articles with proper ordering
+                if has_fetch_order:
+                    order_clause = "ORDER BY fetch_order DESC, created_at DESC"
+                else:
+                    order_clause = "ORDER BY created_at DESC"
+                
                 cursor.execute(f'''
                     SELECT id, title, url, publisher, published_date, summary, thumbnail, 
                            language, category, created_at, updated_at
                     FROM news_articles 
                     WHERE {where_clause}
-                    ORDER BY fetch_order DESC, created_at DESC 
+                    {order_clause}
                     LIMIT ? OFFSET ?
                 ''', params + [limit, offset])
                 
@@ -259,10 +312,22 @@ class DatabaseManager:
         try:
             with self.get_connection() as conn:
                 cursor = conn.cursor()
-                cursor.execute('''
-                    INSERT INTO api_logs (endpoint, response_code, response_time, articles_fetched, page_number)
-                    VALUES (?, ?, ?, ?, ?)
-                ''', (endpoint, response_code, response_time, articles_fetched, page_number))
+                
+                # Check if page_number column exists
+                cursor.execute("PRAGMA table_info(api_logs)")
+                columns = [column[1] for column in cursor.fetchall()]
+                has_page_number = 'page_number' in columns
+                
+                if has_page_number:
+                    cursor.execute('''
+                        INSERT INTO api_logs (endpoint, response_code, response_time, articles_fetched, page_number)
+                        VALUES (?, ?, ?, ?, ?)
+                    ''', (endpoint, response_code, response_time, articles_fetched, page_number))
+                else:
+                    cursor.execute('''
+                        INSERT INTO api_logs (endpoint, response_code, response_time, articles_fetched)
+                        VALUES (?, ?, ?, ?)
+                    ''', (endpoint, response_code, response_time, articles_fetched))
                 conn.commit()
         except sqlite3.Error as e:
             print(f"Database error: {e}")
